@@ -1,5 +1,5 @@
-# Test-Arduino:
-A Test Code made to test USB Serial Communication between Android and Arduino while using Expo
+# Test-Aria-Hardware:
+A Test Code made to test USB Serial Communication between Android and Arduino, and also testing Communication using BLE for BBC:MicroBit V1 while using Expo
 
 # Arduino Sketch:
 const int LED = 13;
