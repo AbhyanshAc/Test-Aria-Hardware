@@ -5,11 +5,27 @@ import { UsbSerialManager, Parity } from 'react-native-usb-serialport-for-androi
 import { stringToHex } from './src/usbSerial';
 
 const BAUD_RATE = 9600;
+const PERMISSION_WAIT_MS = 4000;
 const DEVICE_STATUS = {
   DISCONNECTED: 'Disconnected',
   CONNECTING: 'Connecting',
   CONNECTED: 'Connected',
   ERROR: 'Error',
+};
+
+const waitForUsbPermission = async (deviceId, timeoutMs = PERMISSION_WAIT_MS) => {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const hasPermission = await UsbSerialManager.hasPermission(deviceId);
+    if (hasPermission) {
+      return true;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  return false;
 };
 
 export default function App() {
@@ -52,9 +68,10 @@ export default function App() {
 
       const hasPermission = await UsbSerialManager.hasPermission(arduinoDevice.deviceId);
       if (!hasPermission) {
-        const granted = await UsbSerialManager.tryRequestPermission(arduinoDevice.deviceId);
+        await UsbSerialManager.tryRequestPermission(arduinoDevice.deviceId);
+        const granted = await waitForUsbPermission(arduinoDevice.deviceId);
         if (!granted) {
-          throw new Error('USB permission was denied.');
+          throw new Error('USB permission was not granted in time. Please approve the prompt and try again.');
         }
       }
 
