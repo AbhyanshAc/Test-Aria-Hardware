@@ -25,12 +25,15 @@ export default function App() {
 
   const requestAndroidPermissions = async () => {
     if (Platform.OS !== 'android') return true;
-    const perms = [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
-    // Android 12+ needs BLUETOOTH_SCAN / BLUETOOTH_CONNECT runtime permissions
-    if (Platform.Version >= 31) {
-      perms.push('android.permission.BLUETOOTH_SCAN');
-      perms.push('android.permission.BLUETOOTH_CONNECT');
-    }
+
+    const bluetoothScan = PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN || 'android.permission.BLUETOOTH_SCAN';
+    const bluetoothConnect = PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT || 'android.permission.BLUETOOTH_CONNECT';
+    const bluetoothAdvertise = PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE || 'android.permission.BLUETOOTH_ADVERTISE';
+
+    const perms = Platform.Version >= 31
+      ? [bluetoothScan, bluetoothConnect, bluetoothAdvertise]
+      : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
+
     try {
       const res = await PermissionsAndroid.requestMultiple(perms);
       const denied = Object.entries(res)
