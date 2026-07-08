@@ -1,0 +1,15 @@
+{
+  "name": "microbit-android",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "start": "react-native start",
+    "android": "react-native run-android"
+  },
+  "dependencies": {
+    "react": "18.2.0",
+    "react-native": "0.71.8",
+    "react-native-ble-plx": "^2.0.2",
+    "buffer": "^6.0.3"
+  }
+}
