@@ -1,5 +1,5 @@
 import React, {useState, useEffect, useRef} from 'react';
-import {SafeAreaView, View, Text, Button, StyleSheet, Alert, PermissionsAndroid, Platform, ScrollView} from 'react-native';
+import {SafeAreaView, View, Text, TouchableOpacity, StyleSheet, Alert, PermissionsAndroid, Platform, ScrollView} from 'react-native';
 import {BleManager} from 'react-native-ble-plx';
 import {Buffer} from 'buffer';
 
@@ -106,29 +106,31 @@ export default function App() {
       <ScrollView contentContainerStyle={styles.container}>
         <Text style={styles.title}>micro:bit LED Control (Android)</Text>
 
-        <View style={styles.row}>
-          <Button title={connected ? 'Disconnect' : (scanning ? 'Scanning...' : 'Scan & Connect')} onPress={() => connected ? disconnect() : scanAndConnect()} />
-        </View>
+        <View style={styles.buttonGrid}>
+          <TouchableOpacity style={[styles.actionButton, scanning && styles.disabledButton]} onPress={() => connected ? disconnect() : scanAndConnect()} disabled={false}>
+            <Text style={styles.buttonText}>{connected ? 'Disconnect' : (scanning ? 'Scanning...' : 'Scan & Connect')}</Text>
+          </TouchableOpacity>
 
-        <View style={styles.row}>
-          <Button title={ledOn ? 'Turn LEDs Off' : 'Turn LEDs On'} onPress={() => writeLedMatrix(!ledOn)} disabled={!connected} />
-        </View>
+          <TouchableOpacity style={[styles.actionButton, !connected && styles.disabledButton]} onPress={() => writeLedMatrix(!ledOn)} disabled={!connected}>
+            <Text style={styles.buttonText}>{ledOn ? 'Turn LEDs Off' : 'Turn LEDs On'}</Text>
+          </TouchableOpacity>
 
-        <View style={styles.row}>
-          <Button title="Flicker (3x)" onPress={async () => {
+          <TouchableOpacity style={[styles.actionButton, !connected && styles.disabledButton]} onPress={async () => {
             if (!connected) { Alert.alert('Not connected'); return; }
             for (let i=0;i<3;i++) { await writeLedMatrix(true); await new Promise(r=>setTimeout(r,300)); await writeLedMatrix(false); await new Promise(r=>setTimeout(r,300)); }
-          }} disabled={!connected} />
+          }} disabled={!connected}>
+            <Text style={styles.buttonText}>Flicker (3x)</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity style={[styles.actionButton, !connected && styles.disabledButton]} onPress={() => writeLedMatrix(false)} disabled={!connected}>
+            <Text style={styles.buttonText}>Turn All Off</Text>
+          </TouchableOpacity>
         </View>
 
-        <View style={styles.row}>
-          <Button title="Turn All Off" onPress={() => writeLedMatrix(false)} disabled={!connected} />
-        </View>
-
-        <View style={{marginTop:20}}>
-          <Text>Connected: {connected ? 'yes' : 'no'}</Text>
-          <Text>Device: {device ? (device.name || device.id) : '—'}</Text>
-          <Text>LED state: {ledOn ? 'ON' : 'OFF'}</Text>
+        <View style={styles.statusCard}>
+          <View style={styles.statusRow}><Text style={styles.statusLabel}>Connected</Text><Text style={styles.statusValue}>{connected ? 'Yes' : 'No'}</Text></View>
+          <View style={styles.statusRow}><Text style={styles.statusLabel}>Device</Text><Text style={styles.statusValue}>{device ? (device.name || device.id) : '—'}</Text></View>
+          <View style={styles.statusRow}><Text style={styles.statusLabel}>LED state</Text><Text style={styles.statusValue}>{ledOn ? 'ON' : 'OFF'}</Text></View>
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -136,7 +138,67 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  container: {alignItems:'center', justifyContent:'flex-start', padding:20},
-  title: {fontSize:18, fontWeight:'600', marginBottom:16},
-  row: {width:'100%', marginVertical:8}
+  container: {
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+    padding: 20,
+    backgroundColor: '#f6f7fb',
+  },
+  title: {
+    fontSize: 22,
+    fontWeight: '700',
+    marginBottom: 20,
+    color: '#1f2937',
+  },
+  buttonGrid: {
+    width: '100%',
+    marginTop: 8,
+  },
+  actionButton: {
+    backgroundColor: '#2563eb',
+    paddingVertical: 14,
+    paddingHorizontal: 18,
+    borderRadius: 14,
+    marginBottom: 12,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    shadowOffset: {width: 0, height: 2},
+    elevation: 3,
+  },
+  disabledButton: {
+    backgroundColor: '#94a3b8',
+  },
+  buttonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  statusCard: {
+    width: '100%',
+    backgroundColor: '#ffffff',
+    borderRadius: 16,
+    padding: 18,
+    marginTop: 24,
+    shadowColor: '#000',
+    shadowOpacity: 0.05,
+    shadowRadius: 10,
+    shadowOffset: {width: 0, height: 4},
+    elevation: 2,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  statusLabel: {
+    fontSize: 15,
+    color: '#475569',
+  },
+  statusValue: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#111827',
+  },
 });
