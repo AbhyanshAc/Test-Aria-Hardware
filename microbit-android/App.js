@@ -1,204 +1,1021 @@
-import React, {useState, useEffect, useRef} from 'react';
-import {SafeAreaView, View, Text, TouchableOpacity, StyleSheet, Alert, PermissionsAndroid, Platform, ScrollView} from 'react-native';
-import {BleManager} from 'react-native-ble-plx';
-import {Buffer} from 'buffer';
+/**
+ * micro:bit Blue – React Native Edition
+ * 
+ * Based on the connection process and LED control code from:
+ * https://github.com/microbit-foundation/microbit-blue
+ * Original Author: Martin Woolley (@bluetooth_mdw)
+ * Licensed under Apache License 2.0
+ * 
+ * Rewritten for React Native using react-native-ble-plx
+ */
+
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  SafeAreaView,
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  Alert,
+  PermissionsAndroid,
+  Platform,
+  ScrollView,
+  TextInput,
+  FlatList,
+  ActivityIndicator,
+  StatusBar,
+} from 'react-native';
+import { BleManager } from 'react-native-ble-plx';
+import { Buffer } from 'buffer';
 
 if (typeof global.Buffer === 'undefined') {
   global.Buffer = Buffer;
 }
 
-const LED_SERVICE_UUID = 'E95DD91D-251D-470A-A062-FA1922DFA9A8'.toLowerCase();
-const LED_MATRIX_CHAR = 'E95D7B77-251D-470A-A062-FA1922DFA9A8'.toLowerCase();
+// ─── micro:bit BLE UUIDs (from BleAdapterService.java) ──────────────────────
+// The microbit-blue project stores UUIDs without dashes as 32-char hex strings.
+// Utility.normaliseUUID() inserts dashes: 8-4-4-4-12.
+// react-native-ble-plx expects lowercase dashed UUIDs.
+
+function normaliseUUID(uuid) {
+  if (uuid.length === 4) {
+    return `0000${uuid}-0000-1000-8000-00805f9b34fb`.toLowerCase();
+  }
+  if (uuid.length === 32) {
+    return `${uuid.substring(0, 8)}-${uuid.substring(8, 12)}-${uuid.substring(12, 16)}-${uuid.substring(16, 20)}-${uuid.substring(20, 32)}`.toLowerCase();
+  }
+  return uuid.toLowerCase();
+}
+
+// LED Service
+const LEDSERVICE_SERVICE_UUID = normaliseUUID('E95DD91D251D470AA062FA1922DFA9A8');
+const LEDMATRIXSTATE_CHARACTERISTIC_UUID = normaliseUUID('E95D7B77251D470AA062FA1922DFA9A8');
+const LEDTEXT_CHARACTERISTIC_UUID = normaliseUUID('E95D93EE251D470AA062FA1922DFA9A8');
+const SCROLLINGDELAY_CHARACTERISTIC_UUID = normaliseUUID('E95D0D2D251D470AA062FA1922DFA9A8');
+
+// Device Information Service (for keep-alive reads, same as microbit-blue)
+const DEVICEINFORMATION_SERVICE_UUID = normaliseUUID('0000180A00001000800000805F9B34FB');
+const FIRMWAREREVISIONSTRING_CHARACTERISTIC_UUID = normaliseUUID('00002A2600001000800000805F9B34FB');
+
+// Connection keep-alive interval (from Constants.java: 10000ms)
+const CONNECTION_KEEP_ALIVE_FREQUENCY = 10000;
+
+// Scan timeout (from MainActivity.java: 30000)
+const SCAN_TIMEOUT = 30000;
+
+// Device name filter (from MainActivity.java: "BBC micro")
+const DEVICE_NAME_START = 'BBC micro';
+
+// ─── Connection States (mirrors microbit-blue flow) ──────────────────────────
+const STATE_DISCONNECTED = 'Disconnected';
+const STATE_SCANNING = 'Scanning...';
+const STATE_CONNECTING = 'Connecting to micro:bit';
+const STATE_DISCOVERING = 'Discovering services...';
+const STATE_CONNECTED = 'Connected';
 
 export default function App() {
   const managerRef = useRef(new BleManager());
-  const [device, setDevice] = useState(null);
-  const [connected, setConnected] = useState(false);
-  const [ledOn, setLedOn] = useState(false);
-  const [scanning, setScanning] = useState(false);
+  const keepAliveRef = useRef(null);
+  const deviceRef = useRef(null);
 
+  // ─── State ─────────────────────────────────────────────────────────────────
+  const [connectionState, setConnectionState] = useState(STATE_DISCONNECTED);
+  const [device, setDevice] = useState(null);
+  const [scanResults, setScanResults] = useState([]); // [{id, name, rssi, bonded}]
+  const [ledMatrix, setLedMatrix] = useState([0, 0, 0, 0, 0]); // 5 bytes, rows 1-5
+  const [scrollText, setScrollText] = useState('');
+  const [scrollingDelay, setScrollingDelay] = useState(120);
+  const [logMessages, setLogMessages] = useState([]);
+  const [servicesDiscovered, setServicesDiscovered] = useState(false);
+  const [hasLedService, setHasLedService] = useState(false);
+  const [screenMode, setScreenMode] = useState('scan'); // 'scan' | 'led'
+
+  // ─── Logging (mirrors showMsg pattern) ─────────────────────────────────────
+  const log = useCallback((msg, color = '#aaa') => {
+    setLogMessages(prev => [{ text: msg, color, id: Date.now() + Math.random() }, ...prev].slice(0, 30));
+  }, []);
+
+  // ─── Lifecycle cleanup ─────────────────────────────────────────────────────
   useEffect(() => {
     return () => {
+      if (keepAliveRef.current) clearInterval(keepAliveRef.current);
       managerRef.current.destroy();
     };
   }, []);
 
-  const requestAndroidPermissions = async () => {
+  // Sync deviceRef
+  useEffect(() => { deviceRef.current = device; }, [device]);
+
+  // ─── Permissions (from MainActivity.java) ──────────────────────────────────
+  const requestPermissions = async () => {
     if (Platform.OS !== 'android') return true;
-
-    const bluetoothScan = PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN || 'android.permission.BLUETOOTH_SCAN';
-    const bluetoothConnect = PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT || 'android.permission.BLUETOOTH_CONNECT';
-    const bluetoothAdvertise = PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE || 'android.permission.BLUETOOTH_ADVERTISE';
-
     const perms = Platform.Version >= 31
-      ? [bluetoothScan, bluetoothConnect, bluetoothAdvertise]
+      ? [
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN || 'android.permission.BLUETOOTH_SCAN',
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT || 'android.permission.BLUETOOTH_CONNECT',
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE || 'android.permission.BLUETOOTH_ADVERTISE',
+      ]
       : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
 
     try {
       const res = await PermissionsAndroid.requestMultiple(perms);
-      const denied = Object.entries(res)
-        .filter(([_, value]) => value !== PermissionsAndroid.RESULTS.GRANTED)
-        .map(([key]) => key);
-      const ok = denied.length === 0;
-      if (!ok) {
-        Alert.alert('Permissions', `Required permissions not granted: ${denied.join(', ')}`);
+      const denied = Object.entries(res).filter(([_, v]) => v !== PermissionsAndroid.RESULTS.GRANTED).map(([k]) => k);
+      if (denied.length > 0) {
+        log('Permission not granted: ' + denied.join(', '), '#ff4444');
+        return false;
       }
-      return ok;
+      log('Permissions granted', '#4CAF50');
+      return true;
     } catch (e) {
-      Alert.alert('Permission error', e.message);
+      log('Permission error: ' + e.message, '#ff4444');
       return false;
     }
   };
 
-  const scanAndConnect = async () => {
-    const ok = await requestAndroidPermissions();
+  // ─── Keep-alive (from BleAdapterService.java KeepAlive class) ──────────────
+  // Periodically reads firmware revision to prevent Android from dropping connection
+  const startKeepAlive = useCallback((dev) => {
+    if (keepAliveRef.current) clearInterval(keepAliveRef.current);
+    keepAliveRef.current = setInterval(async () => {
+      try {
+        if (deviceRef.current) {
+          const isConn = await deviceRef.current.isConnected();
+          if (isConn) {
+            await deviceRef.current.readCharacteristicForService(
+              DEVICEINFORMATION_SERVICE_UUID,
+              FIRMWAREREVISIONSTRING_CHARACTERISTIC_UUID
+            );
+          }
+        }
+      } catch (_) { /* keep-alive read failed, connection may have dropped */ }
+    }, CONNECTION_KEEP_ALIVE_FREQUENCY);
+  }, []);
+
+  const stopKeepAlive = useCallback(() => {
+    if (keepAliveRef.current) {
+      clearInterval(keepAliveRef.current);
+      keepAliveRef.current = null;
+    }
+  }, []);
+
+  // ─── Scan (mirrors MainActivity.onScan / BleScanner flow) ──────────────────
+  const startScan = async () => {
+    const ok = await requestPermissions();
     if (!ok) return;
+
+    setScanResults([]);
+    setConnectionState(STATE_SCANNING);
+    log('Scanning for micro:bits...', '#2196F3');
+
     const manager = managerRef.current;
-    setDevice(null);
-    setConnected(false);
-    setScanning(true);
-    manager.startDeviceScan(null, null, (error, scannedDevice) => {
+    const found = new Map();
+
+    manager.startDeviceScan(null, { allowDuplicates: false }, (error, scannedDevice) => {
       if (error) {
-        Alert.alert('Scan error', error.message);
-        setScanning(false);
+        log('Scan error: ' + error.message, '#ff4444');
+        setConnectionState(STATE_DISCONNECTED);
         return;
       }
       if (!scannedDevice) return;
-      const name = (scannedDevice.name || scannedDevice.localName || '').toLowerCase();
-      const hasService = scannedDevice.serviceUUIDs && scannedDevice.serviceUUIDs.map(s=>s.toLowerCase()).includes(LED_SERVICE_UUID);
-      if (name.includes('micro:bit') || hasService) {
-        manager.stopDeviceScan();
-        setScanning(false);
-        scannedDevice.connect()
-          .then(d => d.discoverAllServicesAndCharacteristics())
-          .then(d => {
-            setDevice(d);
-            setConnected(true);
-            Alert.alert('Connected', d.name || d.id);
-          })
-          .catch(e => Alert.alert('Connect error', e.message));
+
+      const name = (scannedDevice.name || scannedDevice.localName || '');
+      // Filter: name starts with "BBC micro" (same as microbit-blue DEVICE_NAME_START)
+      if (name.startsWith(DEVICE_NAME_START) || name.toLowerCase().includes('micro:bit')) {
+        if (!found.has(scannedDevice.id)) {
+          found.set(scannedDevice.id, true);
+          setScanResults(prev => [
+            ...prev,
+            {
+              id: scannedDevice.id,
+              name: name,
+              rssi: scannedDevice.rssi,
+              device: scannedDevice,
+            },
+          ]);
+          log(`Found: ${name} (${scannedDevice.id})`, '#4CAF50');
+        }
       }
     });
-    // Stop scan after 12s
-    setTimeout(() => { manager.stopDeviceScan(); setScanning(false); }, 12000);
+
+    // Auto-stop after SCAN_TIMEOUT (from MainActivity: 30s)
+    setTimeout(() => {
+      manager.stopDeviceScan();
+      setConnectionState(prev => prev === STATE_SCANNING ? STATE_DISCONNECTED : prev);
+      log('Scan complete', '#aaa');
+    }, SCAN_TIMEOUT);
   };
 
-  const writeLedMatrix = async (on) => {
-    if (!device) { Alert.alert('Not connected'); return; }
-    const bytes = on ? new Uint8Array([31,31,31,31,31]) : new Uint8Array([0,0,0,0,0]);
-    const b64 = Buffer.from(bytes).toString('base64');
+  const stopScan = () => {
+    managerRef.current.stopDeviceScan();
+    setConnectionState(STATE_DISCONNECTED);
+    log('Scan stopped', '#aaa');
+  };
+
+  // ─── Connect (mirrors MenuActivity.connectToDevice → GATT flow) ────────────
+  // Flow: connect → GATT_CONNECTED → discoverServices → GATT_SERVICES_DISCOVERED → catalog services
+  const connectToDevice = async (selectedDevice) => {
+    managerRef.current.stopDeviceScan();
+    setConnectionState(STATE_CONNECTING);
+    log(`Connecting to ${selectedDevice.name}...`, '#2196F3');
+
     try {
-      await device.writeCharacteristicWithResponseForService(LED_SERVICE_UUID, LED_MATRIX_CHAR, b64);
-      setLedOn(on);
+      // Step 1: Connect (mirrors BleAdapterService.connect → onConnectionStateChange → GATT_CONNECTED)
+      const connectedDev = await selectedDevice.device.connect({
+        autoConnect: false
+      });
+
+      setConnectionState(STATE_DISCOVERING);
+      log('Connected! Discovering services...', '#4CAF50');
+
+      // Add a stabilization delay. Micro:bits can occasionally drop the connection if
+      // service discovery begins too rapidly after the initial GATT connection completes.
+      await new Promise(resolve => setTimeout(resolve, 1500));
+
+      // Step 2: Discover services
+      const discoveredDev = await connectedDev.discoverAllServicesAndCharacteristics();
+      setDevice(discoveredDev);
+
+
+
+      // Step 3: Catalog services (mirrors MenuActivity handler for GATT_SERVICES_DISCOVERED)
+      const services = await discoveredDev.services();
+      const serviceUuids = services.map(s => s.uuid.toLowerCase());
+      log(`Discovered ${services.length} services`, '#4CAF50');
+
+      for (const svc of services) {
+        log(`  Service: ${svc.uuid}`, '#888');
+      }
+
+      // Check for LED service (mirrors MicroBit.hasService(LEDSERVICE_SERVICE_UUID))
+      const ledServicePresent = serviceUuids.includes(LEDSERVICE_SERVICE_UUID);
+      setHasLedService(ledServicePresent);
+
+      if (ledServicePresent) {
+        log('LED Service available ✓', '#4CAF50');
+      } else {
+        log('LED Service NOT found on this micro:bit', '#ff4444');
+      }
+
+      setServicesDiscovered(true);
+      setConnectionState(STATE_CONNECTED);
+      log('Ready', '#4CAF50');
+
+      // Step 4: Start keep-alive (from BleAdapterService KeepAlive thread)
+      startKeepAlive(discoveredDev);
+
+      // Step 5: Read current LED matrix state (from LEDsActivity.onServiceConnected)
+      if (ledServicePresent) {
+        try {
+          const matrixChar = await discoveredDev.readCharacteristicForService(
+            LEDSERVICE_SERVICE_UUID,
+            LEDMATRIXSTATE_CHARACTERISTIC_UUID
+          );
+          if (matrixChar.value) {
+            const bytes = Buffer.from(matrixChar.value, 'base64');
+            if (bytes.length >= 5) {
+              setLedMatrix([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]]);
+              log('Read LED matrix state', '#4CAF50');
+            }
+          }
+        } catch (e) {
+          log('Could not read LED state: ' + e.message, '#FF9800');
+        }
+
+        // Read scrolling delay (from LEDsActivity handler)
+        try {
+          const delayChar = await discoveredDev.readCharacteristicForService(
+            LEDSERVICE_SERVICE_UUID,
+            SCROLLINGDELAY_CHARACTERISTIC_UUID
+          );
+          if (delayChar.value) {
+            const bytes = Buffer.from(delayChar.value, 'base64');
+            if (bytes.length >= 2) {
+              const delay = (bytes[1] << 8) | bytes[0]; // little-endian (from Utility.shortFromLittleEndianBytes)
+              setScrollingDelay(delay);
+              log(`Scrolling delay: ${delay}ms`, '#888');
+            }
+          }
+        } catch (e) {
+          log('Could not read scrolling delay: ' + e.message, '#FF9800');
+        }
+
+        setScreenMode('led');
+      }
+
+      // Monitor disconnection (mirrors onConnectionStateChange → GATT_DISCONNECT)
+      discoveredDev.onDisconnected((error, dev) => {
+        stopKeepAlive();
+        setDevice(null);
+        setServicesDiscovered(false);
+        setHasLedService(false);
+        setConnectionState(STATE_DISCONNECTED);
+        setScreenMode('scan');
+        log('Disconnected', '#ff4444');
+      });
+
     } catch (e) {
-      Alert.alert('Write error', e.message);
+      setConnectionState(STATE_DISCONNECTED);
+      const detailMsg = e.reason ? `(Reason: ${e.reason}, Code: ${e.errorCode})` : e.message;
+      log('Connection failed: ' + detailMsg, '#ff4444');
     }
   };
 
+  // ─── Disconnect (mirrors BleAdapterService.disconnect) ─────────────────────
   const disconnect = async () => {
-    if (!device) return;
-    try { await device.cancelConnection(); } catch (_) {}
-    setDevice(null); setConnected(false);
+    stopKeepAlive();
+    if (device) {
+      try { await device.cancelConnection(); } catch (_) { }
+    }
+    setDevice(null);
+    setServicesDiscovered(false);
+    setHasLedService(false);
+    setConnectionState(STATE_DISCONNECTED);
+    setScreenMode('scan');
+    log('Disconnected', '#ff4444');
   };
 
+  // ─── LED Matrix Control (from LEDsActivity) ───────────────────────────────
+  // The LED matrix is a 5×5 grid where each row is a byte.
+  // Bit layout per row: bit4=LED1, bit3=LED2, bit2=LED3, bit1=LED4, bit0=LED5
+  // (from LEDsActivity comments:
+  //   Octet 0, LED Row 1: bit4 bit3 bit2 bit1 bit0
+  //   Octet 1, LED Row 2: ...etc)
+
+  const toggleLed = (row, col) => {
+    // col 0 = bit4, col 1 = bit3, ... col 4 = bit0 (from LEDsActivity.onTouch)
+    const bitPos = 4 - col;
+    setLedMatrix(prev => {
+      const next = [...prev];
+      if ((next[row] & (1 << bitPos)) !== 0) {
+        next[row] = next[row] & ~(1 << bitPos);
+      } else {
+        next[row] = next[row] | (1 << bitPos);
+      }
+      return next;
+    });
+  };
+
+  const isLedOn = (row, col) => {
+    const bitPos = 4 - col;
+    return (ledMatrix[row] & (1 << bitPos)) !== 0;
+  };
+
+  // Write LED matrix to micro:bit (from LEDsActivity.onSetDisplay)
+  const writeLedMatrix = async () => {
+    if (!device) { log('Not connected', '#ff4444'); return; }
+    const bytes = new Uint8Array(ledMatrix);
+    const b64 = Buffer.from(bytes).toString('base64');
+    try {
+      await device.writeCharacteristicWithResponseForService(
+        LEDSERVICE_SERVICE_UUID,
+        LEDMATRIXSTATE_CHARACTERISTIC_UUID,
+        b64
+      );
+      log('LED matrix updated', '#4CAF50');
+    } catch (e) {
+      log('Write error: ' + e.message, '#ff4444');
+    }
+  };
+
+  // Send scrolling text (from LEDsActivity.onSendText)
+  const sendScrollText = async () => {
+    if (!device) { log('Not connected', '#ff4444'); return; }
+    if (!scrollText.trim()) { log('Enter text to display', '#FF9800'); return; }
+    try {
+      const utf8Bytes = Buffer.from(scrollText, 'utf-8');
+      const b64 = utf8Bytes.toString('base64');
+      await device.writeCharacteristicWithResponseForService(
+        LEDSERVICE_SERVICE_UUID,
+        LEDTEXT_CHARACTERISTIC_UUID,
+        b64
+      );
+      log(`Sent text: "${scrollText}"`, '#4CAF50');
+    } catch (e) {
+      log('Text write error: ' + e.message, '#ff4444');
+    }
+  };
+
+  // Write scrolling delay (from LEDsActivity.onActivityResult for settings change)
+  const writeScrollingDelay = async (delay) => {
+    if (!device) return;
+    // Little-endian 2 bytes (from Utility.leBytesFromShort)
+    const bytes = new Uint8Array(2);
+    bytes[0] = delay & 0xff;
+    bytes[1] = (delay >> 8) & 0xff;
+    const b64 = Buffer.from(bytes).toString('base64');
+    try {
+      await device.writeCharacteristicWithResponseForService(
+        LEDSERVICE_SERVICE_UUID,
+        SCROLLINGDELAY_CHARACTERISTIC_UUID,
+        b64
+      );
+      log(`Scrolling delay set to ${delay}ms`, '#4CAF50');
+    } catch (e) {
+      log('Delay write error: ' + e.message, '#ff4444');
+    }
+  };
+
+  // Direct write of a specific matrix array (avoids stale closure in patterns)
+  const writeMatrixDirect = async (matrix) => {
+    if (!device) { log('Not connected', '#ff4444'); return; }
+    const bytes = new Uint8Array(matrix);
+    const b64 = Buffer.from(bytes).toString('base64');
+    try {
+      await device.writeCharacteristicWithResponseForService(
+        LEDSERVICE_SERVICE_UUID,
+        LEDMATRIXSTATE_CHARACTERISTIC_UUID,
+        b64
+      );
+      log('LED matrix updated', '#4CAF50');
+    } catch (e) {
+      log('Write error: ' + e.message, '#ff4444');
+    }
+  };
+
+  // Set pattern and write immediately
+  const applyPattern = (matrix) => {
+    setLedMatrix(matrix);
+    writeMatrixDirect(matrix);
+  };
+
+  // Convenience: all LEDs on
+  const allLedsOn = () => applyPattern([31, 31, 31, 31, 31]);
+  // Convenience: all LEDs off
+  const allLedsOff = () => applyPattern([0, 0, 0, 0, 0]);
+
+  // ─── Render ────────────────────────────────────────────────────────────────
+  const isConnected = connectionState === STATE_CONNECTED;
+  const isScanning = connectionState === STATE_SCANNING;
+
   return (
-    <SafeAreaView style={{flex:1}}>
+    <SafeAreaView style={styles.root}>
+      <StatusBar barStyle="light-content" backgroundColor="#0a0e1a" />
       <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>micro:bit LED Control (Android)</Text>
 
-        <View style={styles.buttonGrid}>
-          <TouchableOpacity style={[styles.actionButton, scanning && styles.disabledButton]} onPress={() => connected ? disconnect() : scanAndConnect()} disabled={false}>
-            <Text style={styles.buttonText}>{connected ? 'Disconnect' : (scanning ? 'Scanning...' : 'Scan & Connect')}</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity style={[styles.actionButton, !connected && styles.disabledButton]} onPress={() => writeLedMatrix(!ledOn)} disabled={!connected}>
-            <Text style={styles.buttonText}>{ledOn ? 'Turn LEDs Off' : 'Turn LEDs On'}</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity style={[styles.actionButton, !connected && styles.disabledButton]} onPress={async () => {
-            if (!connected) { Alert.alert('Not connected'); return; }
-            for (let i=0;i<3;i++) { await writeLedMatrix(true); await new Promise(r=>setTimeout(r,300)); await writeLedMatrix(false); await new Promise(r=>setTimeout(r,300)); }
-          }} disabled={!connected}>
-            <Text style={styles.buttonText}>Flicker (3x)</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity style={[styles.actionButton, !connected && styles.disabledButton]} onPress={() => writeLedMatrix(false)} disabled={!connected}>
-            <Text style={styles.buttonText}>Turn All Off</Text>
-          </TouchableOpacity>
+        {/* ── Header ──────────────────────────────────────────────────── */}
+        <View style={styles.header}>
+          <Text style={styles.headerEmoji}>📡</Text>
+          <Text style={styles.headerTitle}>micro:bit Blue</Text>
+          <Text style={styles.headerSubtitle}>BLE LED Controller</Text>
         </View>
 
+        {/* ── Connection Status Card ──────────────────────────────────── */}
         <View style={styles.statusCard}>
-          <View style={styles.statusRow}><Text style={styles.statusLabel}>Connected</Text><Text style={styles.statusValue}>{connected ? 'Yes' : 'No'}</Text></View>
-          <View style={styles.statusRow}><Text style={styles.statusLabel}>Device</Text><Text style={styles.statusValue}>{device ? (device.name || device.id) : '—'}</Text></View>
-          <View style={styles.statusRow}><Text style={styles.statusLabel}>LED state</Text><Text style={styles.statusValue}>{ledOn ? 'ON' : 'OFF'}</Text></View>
+          <View style={styles.statusDot}>
+            <View style={[
+              styles.dot,
+              { backgroundColor: isConnected ? '#4CAF50' : isScanning ? '#FFC107' : '#ff4444' }
+            ]} />
+          </View>
+          <View style={styles.statusInfo}>
+            <Text style={styles.statusLabel}>{connectionState}</Text>
+            <Text style={styles.statusDevice}>
+              {device ? (device.name || device.id) : 'No device'}
+            </Text>
+          </View>
+          {isConnected && (
+            <TouchableOpacity style={styles.disconnectBtn} onPress={disconnect}>
+              <Text style={styles.disconnectBtnText}>✕</Text>
+            </TouchableOpacity>
+          )}
         </View>
+
+        {/* ── Tab Switcher ────────────────────────────────────────────── */}
+        {isConnected && (
+          <View style={styles.tabBar}>
+            <TouchableOpacity
+              style={[styles.tab, screenMode === 'scan' && styles.tabActive]}
+              onPress={() => setScreenMode('scan')}>
+              <Text style={[styles.tabText, screenMode === 'scan' && styles.tabTextActive]}>Scan</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.tab, screenMode === 'led' && styles.tabActive]}
+              onPress={() => setScreenMode('led')}>
+              <Text style={[styles.tabText, screenMode === 'led' && styles.tabTextActive]}>LEDs</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {/* ════════════════════════════════════════════════════════════ */}
+        {/* ── SCAN SCREEN (mirrors MainActivity) ───────────────────── */}
+        {/* ════════════════════════════════════════════════════════════ */}
+        {screenMode === 'scan' && (
+          <View style={styles.section}>
+            <TouchableOpacity
+              style={[styles.primaryBtn, isScanning && styles.scanningBtn]}
+              onPress={isScanning ? stopScan : startScan}
+              disabled={isConnected}>
+              {isScanning && <ActivityIndicator color="#fff" size="small" style={{ marginRight: 8 }} />}
+              <Text style={styles.primaryBtnText}>
+                {isScanning ? 'Stop Scanning' : 'Find BBC micro:bit(s)'}
+              </Text>
+            </TouchableOpacity>
+
+            {scanResults.length > 0 && (
+              <View style={styles.deviceListCard}>
+                <Text style={styles.sectionTitle}>Discovered Devices</Text>
+                {scanResults.map(item => (
+                  <TouchableOpacity
+                    key={item.id}
+                    style={styles.deviceRow}
+                    onPress={() => connectToDevice(item)}
+                    disabled={connectionState !== STATE_DISCONNECTED && connectionState !== STATE_SCANNING}>
+                    <View style={styles.deviceIcon}>
+                      <Text style={{ fontSize: 20 }}>🔲</Text>
+                    </View>
+                    <View style={styles.deviceInfo}>
+                      <Text style={styles.deviceName}>{item.name}</Text>
+                      <Text style={styles.deviceAddr}>{item.id}</Text>
+                    </View>
+                    <Text style={styles.deviceRssi}>{item.rssi} dBm</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            )}
+
+            {scanResults.length === 0 && !isScanning && connectionState === STATE_DISCONNECTED && (
+              <View style={styles.emptyState}>
+                <Text style={styles.emptyEmoji}>📱</Text>
+                <Text style={styles.emptyText}>Tap "Find" to scan for nearby micro:bits</Text>
+                <Text style={styles.emptyHint}>
+                  Make sure your micro:bit is paired and within range
+                </Text>
+              </View>
+            )}
+
+            {(connectionState === STATE_CONNECTING || connectionState === STATE_DISCOVERING) && (
+              <View style={styles.connectingOverlay}>
+                <ActivityIndicator color="#6366f1" size="large" />
+                <Text style={styles.connectingText}>{connectionState}</Text>
+              </View>
+            )}
+          </View>
+        )}
+
+        {/* ════════════════════════════════════════════════════════════ */}
+        {/* ── LED SCREEN (mirrors LEDsActivity) ────────────────────── */}
+        {/* ════════════════════════════════════════════════════════════ */}
+        {screenMode === 'led' && isConnected && (
+          <View style={styles.section}>
+
+            {!hasLedService ? (
+              <View style={styles.warningCard}>
+                <Text style={styles.warningText}>⚠️ LED Service not available on this micro:bit</Text>
+              </View>
+            ) : (
+              <>
+                {/* ── 5×5 LED Grid (mirrors LEDsActivity GridLayout) ── */}
+                <Text style={styles.sectionTitle}>LED Matrix</Text>
+                <View style={styles.ledGridCard}>
+                  <View style={styles.ledGrid}>
+                    {[0, 1, 2, 3, 4].map(row => (
+                      <View key={row} style={styles.ledRow}>
+                        {[0, 1, 2, 3, 4].map(col => (
+                          <TouchableOpacity
+                            key={col}
+                            style={[
+                              styles.ledCell,
+                              isLedOn(row, col) ? styles.ledOn : styles.ledOff,
+                            ]}
+                            onPress={() => toggleLed(row, col)}
+                            activeOpacity={0.7}>
+                            <View style={[
+                              styles.ledDot,
+                              isLedOn(row, col) ? styles.ledDotOn : styles.ledDotOff,
+                            ]} />
+                          </TouchableOpacity>
+                        ))}
+                      </View>
+                    ))}
+                  </View>
+
+                  {/* ── Matrix Action Buttons ── */}
+                  <View style={styles.matrixActions}>
+                    <TouchableOpacity style={styles.actionBtn} onPress={writeLedMatrix}>
+                      <Text style={styles.actionBtnText}>Set Display</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.actionBtnSecondary} onPress={allLedsOn}>
+                      <Text style={styles.actionBtnSecondaryText}>All On</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.actionBtnSecondary} onPress={allLedsOff}>
+                      <Text style={styles.actionBtnSecondaryText}>All Off</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* ── Scrolling Text (from LEDsActivity.onSendText) ── */}
+                <Text style={styles.sectionTitle}>Scrolling Text</Text>
+                <View style={styles.textCard}>
+                  <TextInput
+                    style={styles.textInput}
+                    value={scrollText}
+                    onChangeText={setScrollText}
+                    placeholder="Enter text to display"
+                    placeholderTextColor="#555"
+                    maxLength={20}
+                  />
+                  <TouchableOpacity style={styles.sendBtn} onPress={sendScrollText}>
+                    <Text style={styles.sendBtnText}>Send</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {/* ── Scrolling Delay (from LEDsSettingsActivity) ── */}
+                <Text style={styles.sectionTitle}>Scrolling Delay</Text>
+                <View style={styles.delayCard}>
+                  <View style={styles.delayRow}>
+                    <TouchableOpacity
+                      style={styles.delayBtn}
+                      onPress={() => {
+                        const newVal = Math.max(10, scrollingDelay - 20);
+                        setScrollingDelay(newVal);
+                        writeScrollingDelay(newVal);
+                      }}>
+                      <Text style={styles.delayBtnText}>−</Text>
+                    </TouchableOpacity>
+                    <Text style={styles.delayValue}>{scrollingDelay} ms</Text>
+                    <TouchableOpacity
+                      style={styles.delayBtn}
+                      onPress={() => {
+                        const newVal = Math.min(2000, scrollingDelay + 20);
+                        setScrollingDelay(newVal);
+                        writeScrollingDelay(newVal);
+                      }}>
+                      <Text style={styles.delayBtnText}>+</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* ── Quick Patterns ── */}
+                <Text style={styles.sectionTitle}>Quick Patterns</Text>
+                <View style={styles.patternsRow}>
+                  <TouchableOpacity style={styles.patternBtn} onPress={() => applyPattern([0b01110, 0b11111, 0b11111, 0b01110, 0b00100])}>
+                    <Text style={styles.patternEmoji}>❤️</Text>
+                    <Text style={styles.patternLabel}>Heart</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.patternBtn} onPress={() => applyPattern([0b01010, 0b01010, 0b00000, 0b10001, 0b01110])}>
+                    <Text style={styles.patternEmoji}>😊</Text>
+                    <Text style={styles.patternLabel}>Smiley</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.patternBtn} onPress={() => applyPattern([0b00100, 0b01110, 0b11111, 0b01110, 0b00100])}>
+                    <Text style={styles.patternEmoji}>💎</Text>
+                    <Text style={styles.patternLabel}>Diamond</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.patternBtn} onPress={() => applyPattern([0b10001, 0b01010, 0b00100, 0b01010, 0b10001])}>
+                    <Text style={styles.patternEmoji}>✖️</Text>
+                    <Text style={styles.patternLabel}>Cross</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
+          </View>
+        )}
+
+        {/* ── Console Log (mirrors message display in microbit-blue) ── */}
+        <View style={styles.consoleCard}>
+          <Text style={styles.consoleTitle}>Console</Text>
+          <ScrollView
+            style={styles.consoleScroll}
+            contentContainerStyle={styles.consoleScrollContent}
+            nestedScrollEnabled={true}>
+            {logMessages.map(msg => (
+              <Text key={msg.id} style={[styles.consoleMsg, { color: msg.color }]}>
+                {msg.text}
+              </Text>
+            ))}
+            {logMessages.length === 0 && (
+              <Text style={styles.consolePlaceholder}>No messages yet</Text>
+            )}
+          </ScrollView>
+        </View>
+
       </ScrollView>
     </SafeAreaView>
   );
 }
 
+// ─── Styles ──────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+    backgroundColor: '#0a0e1a',
+  },
   container: {
+    padding: 16,
+    paddingBottom: 40,
+  },
+
+  // Header
+  header: {
     alignItems: 'center',
-    justifyContent: 'flex-start',
-    padding: 20,
-    backgroundColor: '#f6f7fb',
+    paddingVertical: 20,
+    marginBottom: 8,
   },
-  title: {
-    fontSize: 22,
-    fontWeight: '700',
-    marginBottom: 20,
-    color: '#1f2937',
+  headerEmoji: { fontSize: 36, marginBottom: 6 },
+  headerTitle: {
+    fontSize: 26,
+    fontWeight: '800',
+    color: '#e8eaed',
+    letterSpacing: 0.5,
   },
-  buttonGrid: {
-    width: '100%',
-    marginTop: 8,
+  headerSubtitle: {
+    fontSize: 13,
+    color: '#6366f1',
+    fontWeight: '600',
+    marginTop: 4,
+    letterSpacing: 1,
+    textTransform: 'uppercase',
   },
-  actionButton: {
-    backgroundColor: '#2563eb',
-    paddingVertical: 14,
-    paddingHorizontal: 18,
-    borderRadius: 14,
-    marginBottom: 12,
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOpacity: 0.08,
-    shadowRadius: 8,
-    shadowOffset: {width: 0, height: 2},
-    elevation: 3,
-  },
-  disabledButton: {
-    backgroundColor: '#94a3b8',
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '700',
-  },
+
+  // Status card
   statusCard: {
-    width: '100%',
-    backgroundColor: '#ffffff',
-    borderRadius: 16,
-    padding: 18,
-    marginTop: 24,
-    shadowColor: '#000',
-    shadowOpacity: 0.05,
-    shadowRadius: 10,
-    shadowOffset: {width: 0, height: 4},
-    elevation: 2,
-  },
-  statusRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#12162a',
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#1e2340',
+  },
+  statusDot: { marginRight: 12 },
+  dot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+  },
+  statusInfo: { flex: 1 },
+  statusLabel: { fontSize: 15, fontWeight: '700', color: '#e8eaed' },
+  statusDevice: { fontSize: 12, color: '#6b7280', marginTop: 2 },
+  disconnectBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255,68,68,0.15)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  disconnectBtnText: { color: '#ff4444', fontSize: 16, fontWeight: '700' },
+
+  // Tabs
+  tabBar: {
+    flexDirection: 'row',
+    backgroundColor: '#12162a',
+    borderRadius: 12,
+    padding: 4,
     marginBottom: 12,
   },
-  statusLabel: {
-    fontSize: 15,
-    color: '#475569',
+  tab: {
+    flex: 1,
+    paddingVertical: 10,
+    alignItems: 'center',
+    borderRadius: 10,
   },
-  statusValue: {
-    fontSize: 15,
+  tabActive: {
+    backgroundColor: '#6366f1',
+  },
+  tabText: { fontSize: 14, fontWeight: '600', color: '#6b7280' },
+  tabTextActive: { color: '#fff' },
+
+  // Sections
+  section: { marginBottom: 8 },
+  sectionTitle: {
+    fontSize: 13,
     fontWeight: '700',
-    color: '#111827',
+    color: '#6366f1',
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    marginBottom: 8,
+    marginTop: 12,
+    marginLeft: 4,
   },
+
+  // Primary button
+  primaryBtn: {
+    flexDirection: 'row',
+    backgroundColor: '#6366f1',
+    paddingVertical: 16,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 12,
+    shadowColor: '#6366f1',
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 6,
+  },
+  scanningBtn: { backgroundColor: '#FF9800' },
+  primaryBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+
+  // Device list
+  deviceListCard: {
+    backgroundColor: '#12162a',
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#1e2340',
+  },
+  deviceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1e2340',
+  },
+  deviceIcon: { marginRight: 12 },
+  deviceInfo: { flex: 1 },
+  deviceName: { fontSize: 15, fontWeight: '700', color: '#e8eaed' },
+  deviceAddr: { fontSize: 11, color: '#6b7280', marginTop: 2, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  deviceRssi: { fontSize: 12, color: '#6366f1', fontWeight: '600' },
+
+  // Empty state
+  emptyState: { alignItems: 'center', paddingVertical: 40 },
+  emptyEmoji: { fontSize: 48, marginBottom: 12 },
+  emptyText: { fontSize: 16, color: '#6b7280', fontWeight: '600' },
+  emptyHint: { fontSize: 12, color: '#444', marginTop: 6, textAlign: 'center' },
+
+  // Connecting overlay
+  connectingOverlay: { alignItems: 'center', paddingVertical: 40 },
+  connectingText: { color: '#6366f1', fontSize: 16, fontWeight: '600', marginTop: 12 },
+
+  // Warning
+  warningCard: {
+    backgroundColor: 'rgba(255,152,0,0.1)',
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(255,152,0,0.3)',
+  },
+  warningText: { color: '#FF9800', fontSize: 14, fontWeight: '600' },
+
+  // LED grid
+  ledGridCard: {
+    backgroundColor: '#12162a',
+    borderRadius: 16,
+    padding: 20,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#1e2340',
+  },
+  ledGrid: { marginBottom: 16 },
+  ledRow: { flexDirection: 'row' },
+  ledCell: {
+    width: 52,
+    height: 52,
+    margin: 3,
+    borderRadius: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  ledOn: { backgroundColor: 'rgba(239,68,68,0.15)' },
+  ledOff: { backgroundColor: 'rgba(255,255,255,0.04)' },
+  ledDot: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+  },
+  ledDotOn: {
+    backgroundColor: '#ef4444',
+    shadowColor: '#ef4444',
+    shadowOpacity: 0.8,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 8,
+  },
+  ledDotOff: {
+    backgroundColor: '#2a2e42',
+    borderWidth: 1,
+    borderColor: '#3a3e52',
+  },
+
+  // Matrix actions
+  matrixActions: {
+    flexDirection: 'row',
+    width: '100%',
+    gap: 8,
+  },
+  actionBtn: {
+    flex: 2,
+    backgroundColor: '#6366f1',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  actionBtnText: { color: '#fff', fontSize: 14, fontWeight: '700' },
+  actionBtnSecondary: {
+    flex: 1,
+    backgroundColor: 'rgba(99,102,241,0.12)',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(99,102,241,0.25)',
+  },
+  actionBtnSecondaryText: { color: '#6366f1', fontSize: 13, fontWeight: '700' },
+
+  // Text input
+  textCard: {
+    flexDirection: 'row',
+    backgroundColor: '#12162a',
+    borderRadius: 14,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#1e2340',
+  },
+  textInput: {
+    flex: 1,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    color: '#e8eaed',
+    fontSize: 15,
+  },
+  sendBtn: {
+    backgroundColor: '#6366f1',
+    paddingHorizontal: 24,
+    justifyContent: 'center',
+  },
+  sendBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
+
+  // Delay control
+  delayCard: {
+    backgroundColor: '#12162a',
+    borderRadius: 14,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#1e2340',
+  },
+  delayRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  delayBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(99,102,241,0.12)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(99,102,241,0.25)',
+  },
+  delayBtnText: { color: '#6366f1', fontSize: 24, fontWeight: '700' },
+  delayValue: {
+    color: '#e8eaed',
+    fontSize: 18,
+    fontWeight: '700',
+    marginHorizontal: 24,
+    minWidth: 80,
+    textAlign: 'center',
+  },
+
+  // Patterns
+  patternsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 8,
+  },
+  patternBtn: {
+    flex: 1,
+    backgroundColor: '#12162a',
+    borderRadius: 14,
+    paddingVertical: 14,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#1e2340',
+  },
+  patternEmoji: { fontSize: 24, marginBottom: 4 },
+  patternLabel: { fontSize: 11, color: '#6b7280', fontWeight: '600' },
+
+  // Console
+  consoleCard: {
+    backgroundColor: '#0d1117',
+    borderRadius: 14,
+    padding: 16,
+    marginTop: 16,
+    borderWidth: 1,
+    borderColor: '#1e2340',
+    height: 200,
+    overflow: 'hidden',
+  },
+  consoleScroll: {
+    flex: 1,
+  },
+  consoleScrollContent: {
+    paddingBottom: 8,
+  },
+  consoleTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#444',
+    letterSpacing: 0.5,
+    textTransform: 'uppercase',
+    marginBottom: 8,
+  },
+  consoleMsg: {
+    fontSize: 12,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    marginBottom: 3,
+  },
+  consolePlaceholder: { fontSize: 12, color: '#333' },
 });
