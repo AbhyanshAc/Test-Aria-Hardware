@@ -53,6 +53,12 @@ const LEDMATRIXSTATE_CHARACTERISTIC_UUID = normaliseUUID('E95D7B77251D470AA062FA
 const LEDTEXT_CHARACTERISTIC_UUID = normaliseUUID('E95D93EE251D470AA062FA1922DFA9A8');
 const SCROLLINGDELAY_CHARACTERISTIC_UUID = normaliseUUID('E95D0D2D251D470AA062FA1922DFA9A8');
 
+// IO Pin Service
+const IOPINSERVICE_SERVICE_UUID = normaliseUUID('E95D127B251D470AA062FA1922DFA9A8');
+const PINDATA_CHARACTERISTIC_UUID = normaliseUUID('E95D8D00251D470AA062FA1922DFA9A8');
+const PINADCONFIGURATION_CHARACTERISTIC_UUID = normaliseUUID('E95D5899251D470AA062FA1922DFA9A8');
+const PINIOCONFIGURATION_CHARACTERISTIC_UUID = normaliseUUID('E95DB9FE251D470AA062FA1922DFA9A8');
+
 // Device Information Service (for keep-alive reads, same as microbit-blue)
 const DEVICEINFORMATION_SERVICE_UUID = normaliseUUID('0000180A00001000800000805F9B34FB');
 const FIRMWAREREVISIONSTRING_CHARACTERISTIC_UUID = normaliseUUID('00002A2600001000800000805F9B34FB');
@@ -88,7 +94,8 @@ export default function App() {
   const [logMessages, setLogMessages] = useState([]);
   const [servicesDiscovered, setServicesDiscovered] = useState(false);
   const [hasLedService, setHasLedService] = useState(false);
-  const [screenMode, setScreenMode] = useState('scan'); // 'scan' | 'led'
+  const [hasIoPinService, setHasIoPinService] = useState(false);
+  const [screenMode, setScreenMode] = useState('scan'); // 'scan' | 'analog'
 
   // ─── Logging (mirrors showMsg pattern) ─────────────────────────────────────
   const log = useCallback((msg, color = '#aaa') => {
@@ -250,10 +257,20 @@ export default function App() {
       const ledServicePresent = serviceUuids.includes(LEDSERVICE_SERVICE_UUID);
       setHasLedService(ledServicePresent);
 
+      // Check for IO Pin service
+      const ioPinServicePresent = serviceUuids.includes(IOPINSERVICE_SERVICE_UUID);
+      setHasIoPinService(ioPinServicePresent);
+
       if (ledServicePresent) {
         log('LED Service available ✓', '#4CAF50');
       } else {
         log('LED Service NOT found on this micro:bit', '#ff4444');
+      }
+
+      if (ioPinServicePresent) {
+        log('IO Pin Service available ✓', '#4CAF50');
+      } else {
+        log('IO Pin Service NOT found on this micro:bit', '#ff4444');
       }
 
       setServicesDiscovered(true);
@@ -299,7 +316,7 @@ export default function App() {
           log('Could not read scrolling delay: ' + e.message, '#FF9800');
         }
 
-        setScreenMode('led');
+        setScreenMode('analog');
       }
 
       // Monitor disconnection (mirrors onConnectionStateChange → GATT_DISCONNECT)
@@ -308,6 +325,7 @@ export default function App() {
         setDevice(null);
         setServicesDiscovered(false);
         setHasLedService(false);
+        setHasIoPinService(false);
         setConnectionState(STATE_DISCONNECTED);
         setScreenMode('scan');
         log('Disconnected', '#ff4444');
@@ -329,6 +347,7 @@ export default function App() {
     setDevice(null);
     setServicesDiscovered(false);
     setHasLedService(false);
+    setHasIoPinService(false);
     setConnectionState(STATE_DISCONNECTED);
     setScreenMode('scan');
     log('Disconnected', '#ff4444');
@@ -443,6 +462,76 @@ export default function App() {
   // Convenience: all LEDs off
   const allLedsOff = () => applyPattern([0, 0, 0, 0, 0]);
 
+  // ─── IO Pin Analog Output Control ─────────────────────────────────────────────
+  // Configure pin 0 for analog output
+  const configurePin0AnalogOutput = async () => {
+    if (!device) { log('Not connected', '#ff4444'); return false; }
+
+    try {
+      // Configure pin 0 as analog (set bit 0 in PINADCONFIGURATION)
+      const adFlags = new Uint8Array([0x01]); // bit 0 = analog for pin 0
+      const adB64 = Buffer.from(adFlags).toString('base64');
+      await device.writeCharacteristicWithResponseForService(
+        IOPINSERVICE_SERVICE_UUID,
+        PINADCONFIGURATION_CHARACTERISTIC_UUID,
+        adB64
+      );
+
+      // Configure pin 0 as output (clear bit 0 in PINIOCONFIGURATION - 0 = output)
+      const ioFlags = new Uint8Array([0x00]); // bit 0 = 0 = output for pin 0
+      const ioB64 = Buffer.from(ioFlags).toString('base64');
+      await device.writeCharacteristicWithResponseForService(
+        IOPINSERVICE_SERVICE_UUID,
+        PINIOCONFIGURATION_CHARACTERISTIC_UUID,
+        ioB64
+      );
+
+      log('Pin 0 configured for analog output', '#4CAF50');
+      return true;
+    } catch (e) {
+      log('Pin configuration error: ' + e.message, '#ff4444');
+      return false;
+    }
+  };
+
+  // Write analog value to pin 0 (0-1023)
+  const writeAnalogValue = async (value) => {
+    if (!device) { log('Not connected', '#ff4444'); return; }
+
+    try {
+      // Format: [pin_number (uint8), value (uint16 little endian)]
+      const bytes = new Uint8Array(3);
+      bytes[0] = 0x00; // pin 0
+      bytes[1] = value & 0xff; // low byte
+      bytes[2] = (value >> 8) & 0xff; // high byte
+      const b64 = Buffer.from(bytes).toString('base64');
+      await device.writeCharacteristicWithResponseForService(
+        IOPINSERVICE_SERVICE_UUID,
+        PINDATA_CHARACTERISTIC_UUID,
+        b64
+      );
+      log(`Pin 0 analog value set to ${value}`, '#4CAF50');
+    } catch (e) {
+      log('Analog write error: ' + e.message, '#ff4444');
+    }
+  };
+
+  // Set pin 0 to maximum (1023)
+  const setPin0Max = async () => {
+    const configured = await configurePin0AnalogOutput();
+    if (configured) {
+      await writeAnalogValue(1023);
+    }
+  };
+
+  // Set pin 0 to minimum (0)
+  const setPin0Min = async () => {
+    const configured = await configurePin0AnalogOutput();
+    if (configured) {
+      await writeAnalogValue(0);
+    }
+  };
+
   // ─── Render ────────────────────────────────────────────────────────────────
   const isConnected = connectionState === STATE_CONNECTED;
   const isScanning = connectionState === STATE_SCANNING;
@@ -456,7 +545,7 @@ export default function App() {
         <View style={styles.header}>
           <Text style={styles.headerEmoji}>📡</Text>
           <Text style={styles.headerTitle}>micro:bit Blue</Text>
-          <Text style={styles.headerSubtitle}>BLE LED Controller</Text>
+          <Text style={styles.headerSubtitle}>BLE Analog Controller</Text>
         </View>
 
         {/* ── Connection Status Card ──────────────────────────────────── */}
@@ -489,9 +578,9 @@ export default function App() {
               <Text style={[styles.tabText, screenMode === 'scan' && styles.tabTextActive]}>Scan</Text>
             </TouchableOpacity>
             <TouchableOpacity
-              style={[styles.tab, screenMode === 'led' && styles.tabActive]}
-              onPress={() => setScreenMode('led')}>
-              <Text style={[styles.tabText, screenMode === 'led' && styles.tabTextActive]}>LEDs</Text>
+              style={[styles.tab, screenMode === 'analog' && styles.tabActive]}
+              onPress={() => setScreenMode('analog')}>
+              <Text style={[styles.tabText, screenMode === 'analog' && styles.tabTextActive]}>Analog</Text>
             </TouchableOpacity>
           </View>
         )}
@@ -553,117 +642,47 @@ export default function App() {
         )}
 
         {/* ════════════════════════════════════════════════════════════ */}
-        {/* ── LED SCREEN (mirrors LEDsActivity) ────────────────────── */}
+        {/* ── ANALOG OUTPUT SCREEN ─────────────────────────────────── */}
         {/* ════════════════════════════════════════════════════════════ */}
-        {screenMode === 'led' && isConnected && (
+        {screenMode === 'analog' && isConnected && (
           <View style={styles.section}>
 
-            {!hasLedService ? (
+            {!hasIoPinService ? (
               <View style={styles.warningCard}>
-                <Text style={styles.warningText}>⚠️ LED Service not available on this micro:bit</Text>
+                <Text style={styles.warningText}>⚠️ IO Pin Service not available on this micro:bit</Text>
+                <Text style={styles.warningHint}>Make sure you're using the DAL hex file with IO Pin Service enabled</Text>
               </View>
             ) : (
               <>
-                {/* ── 5×5 LED Grid (mirrors LEDsActivity GridLayout) ── */}
-                <Text style={styles.sectionTitle}>LED Matrix</Text>
-                <View style={styles.ledGridCard}>
-                  <View style={styles.ledGrid}>
-                    {[0, 1, 2, 3, 4].map(row => (
-                      <View key={row} style={styles.ledRow}>
-                        {[0, 1, 2, 3, 4].map(col => (
-                          <TouchableOpacity
-                            key={col}
-                            style={[
-                              styles.ledCell,
-                              isLedOn(row, col) ? styles.ledOn : styles.ledOff,
-                            ]}
-                            onPress={() => toggleLed(row, col)}
-                            activeOpacity={0.7}>
-                            <View style={[
-                              styles.ledDot,
-                              isLedOn(row, col) ? styles.ledDotOn : styles.ledDotOff,
-                            ]} />
-                          </TouchableOpacity>
-                        ))}
-                      </View>
-                    ))}
+                {/* ── Pin 0 Analog Output Control ── */}
+                <Text style={styles.sectionTitle}>Pin 0 Analog Output</Text>
+                <View style={styles.analogControlCard}>
+                  <View style={styles.pinInfo}>
+                    <Text style={styles.pinLabel}>Pin 0</Text>
+                    <Text style={styles.pinDescription}>Analog output (0-1023)</Text>
                   </View>
 
-                  {/* ── Matrix Action Buttons ── */}
-                  <View style={styles.matrixActions}>
-                    <TouchableOpacity style={styles.actionBtn} onPress={writeLedMatrix}>
-                      <Text style={styles.actionBtnText}>Set Display</Text>
+                  <View style={styles.analogButtons}>
+                    <TouchableOpacity 
+                      style={[styles.analogBtn, styles.analogBtnOn]} 
+                      onPress={setPin0Max}>
+                      <Text style={styles.analogBtnText}>ON (1023)</Text>
                     </TouchableOpacity>
-                    <TouchableOpacity style={styles.actionBtnSecondary} onPress={allLedsOn}>
-                      <Text style={styles.actionBtnSecondaryText}>All On</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={styles.actionBtnSecondary} onPress={allLedsOff}>
-                      <Text style={styles.actionBtnSecondaryText}>All Off</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-
-                {/* ── Scrolling Text (from LEDsActivity.onSendText) ── */}
-                <Text style={styles.sectionTitle}>Scrolling Text</Text>
-                <View style={styles.textCard}>
-                  <TextInput
-                    style={styles.textInput}
-                    value={scrollText}
-                    onChangeText={setScrollText}
-                    placeholder="Enter text to display"
-                    placeholderTextColor="#555"
-                    maxLength={20}
-                  />
-                  <TouchableOpacity style={styles.sendBtn} onPress={sendScrollText}>
-                    <Text style={styles.sendBtnText}>Send</Text>
-                  </TouchableOpacity>
-                </View>
-
-                {/* ── Scrolling Delay (from LEDsSettingsActivity) ── */}
-                <Text style={styles.sectionTitle}>Scrolling Delay</Text>
-                <View style={styles.delayCard}>
-                  <View style={styles.delayRow}>
-                    <TouchableOpacity
-                      style={styles.delayBtn}
-                      onPress={() => {
-                        const newVal = Math.max(10, scrollingDelay - 20);
-                        setScrollingDelay(newVal);
-                        writeScrollingDelay(newVal);
-                      }}>
-                      <Text style={styles.delayBtnText}>−</Text>
-                    </TouchableOpacity>
-                    <Text style={styles.delayValue}>{scrollingDelay} ms</Text>
-                    <TouchableOpacity
-                      style={styles.delayBtn}
-                      onPress={() => {
-                        const newVal = Math.min(2000, scrollingDelay + 20);
-                        setScrollingDelay(newVal);
-                        writeScrollingDelay(newVal);
-                      }}>
-                      <Text style={styles.delayBtnText}>+</Text>
+                    <TouchableOpacity 
+                      style={[styles.analogBtn, styles.analogBtnOff]} 
+                      onPress={setPin0Min}>
+                      <Text style={styles.analogBtnText}>OFF (0)</Text>
                     </TouchableOpacity>
                   </View>
-                </View>
 
-                {/* ── Quick Patterns ── */}
-                <Text style={styles.sectionTitle}>Quick Patterns</Text>
-                <View style={styles.patternsRow}>
-                  <TouchableOpacity style={styles.patternBtn} onPress={() => applyPattern([0b01110, 0b11111, 0b11111, 0b01110, 0b00100])}>
-                    <Text style={styles.patternEmoji}>❤️</Text>
-                    <Text style={styles.patternLabel}>Heart</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={styles.patternBtn} onPress={() => applyPattern([0b01010, 0b01010, 0b00000, 0b10001, 0b01110])}>
-                    <Text style={styles.patternEmoji}>😊</Text>
-                    <Text style={styles.patternLabel}>Smiley</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={styles.patternBtn} onPress={() => applyPattern([0b00100, 0b01110, 0b11111, 0b01110, 0b00100])}>
-                    <Text style={styles.patternEmoji}>💎</Text>
-                    <Text style={styles.patternLabel}>Diamond</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={styles.patternBtn} onPress={() => applyPattern([0b10001, 0b01010, 0b00100, 0b01010, 0b10001])}>
-                    <Text style={styles.patternEmoji}>✖️</Text>
-                    <Text style={styles.patternLabel}>Cross</Text>
-                  </TouchableOpacity>
+                  <View style={styles.analogInfo}>
+                    <Text style={styles.analogInfoText}>
+                      Press ON to set pin 0 to maximum analog value (1023)
+                    </Text>
+                    <Text style={styles.analogInfoText}>
+                      Press OFF to set pin 0 to minimum analog value (0)
+                    </Text>
+                  </View>
                 </View>
               </>
             )}
@@ -847,6 +866,69 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,152,0,0.3)',
   },
   warningText: { color: '#FF9800', fontSize: 14, fontWeight: '600' },
+  warningHint: { color: '#FFB74D', fontSize: 12, marginTop: 4 },
+
+  // Analog control card
+  analogControlCard: {
+    backgroundColor: '#12162a',
+    borderRadius: 16,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#1e2340',
+  },
+  pinInfo: {
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  pinLabel: {
+    fontSize: 24,
+    fontWeight: '800',
+    color: '#e8eaed',
+  },
+  pinDescription: {
+    fontSize: 13,
+    color: '#6b7280',
+    marginTop: 4,
+  },
+  analogButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 16,
+  },
+  analogBtn: {
+    flex: 1,
+    paddingVertical: 18,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginHorizontal: 6,
+    shadowColor: '#000',
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 4,
+  },
+  analogBtnOn: {
+    backgroundColor: '#4CAF50',
+  },
+  analogBtnOff: {
+    backgroundColor: '#ff4444',
+  },
+  analogBtnText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  analogInfo: {
+    backgroundColor: 'rgba(99,102,241,0.1)',
+    borderRadius: 8,
+    padding: 12,
+  },
+  analogInfoText: {
+    color: '#6366f1',
+    fontSize: 12,
+    lineHeight: 18,
+  },
 
   // LED grid
   ledGridCard: {
