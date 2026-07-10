@@ -14,6 +14,9 @@ void loop() {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
 
+# BBC MicroBit:
+Uses the DAL hex file on the microbit for testing BLE in https://tech.microbit.org/bluetooth/
+
     if (cmd == "ON")
       digitalWrite(LED, HIGH);
 
