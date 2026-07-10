@@ -499,18 +499,20 @@ export default function App() {
     if (!device) { log('Not connected', '#ff4444'); return; }
 
     try {
-      // Format: [pin_number (uint8), value (uint16 little endian)]
-      const bytes = new Uint8Array(3);
+      // Format: [pin_number (uint8), value (uint8)]
+      // micro:bit compresses 10-bit analog values to 8 bits
+      // Convert 0-1023 to 0-255 by dividing by 4
+      const compressedValue = Math.floor(value / 4);
+      const bytes = new Uint8Array(2);
       bytes[0] = 0x00; // pin 0
-      bytes[1] = value & 0xff; // low byte
-      bytes[2] = (value >> 8) & 0xff; // high byte
+      bytes[1] = compressedValue; // compressed analog value (0-255)
       const b64 = Buffer.from(bytes).toString('base64');
       await device.writeCharacteristicWithResponseForService(
         IOPINSERVICE_SERVICE_UUID,
         PINDATA_CHARACTERISTIC_UUID,
         b64
       );
-      log(`Pin 0 analog value set to ${value}`, '#4CAF50');
+      log(`Pin 0 analog value set to ${value} (compressed: ${compressedValue})`, '#4CAF50');
     } catch (e) {
       log('Analog write error: ' + e.message, '#ff4444');
     }
@@ -518,18 +520,12 @@ export default function App() {
 
   // Set pin 0 to maximum (1023)
   const setPin0Max = async () => {
-    const configured = await configurePin0AnalogOutput();
-    if (configured) {
-      await writeAnalogValue(1023);
-    }
+    await writeAnalogValue(1023);
   };
 
   // Set pin 0 to minimum (0)
   const setPin0Min = async () => {
-    const configured = await configurePin0AnalogOutput();
-    if (configured) {
-      await writeAnalogValue(0);
-    }
+    await writeAnalogValue(0);
   };
 
   // ─── Render ────────────────────────────────────────────────────────────────
@@ -665,22 +661,22 @@ export default function App() {
                   <View style={styles.analogButtons}>
                     <TouchableOpacity 
                       style={[styles.analogBtn, styles.analogBtnOn]} 
-                      onPress={setPin0Max}>
-                      <Text style={styles.analogBtnText}>ON (1023)</Text>
+                      onPress={setPin0Min}>
+                      <Text style={styles.analogBtnText}>ON (0)</Text>
                     </TouchableOpacity>
                     <TouchableOpacity 
                       style={[styles.analogBtn, styles.analogBtnOff]} 
-                      onPress={setPin0Min}>
-                      <Text style={styles.analogBtnText}>OFF (0)</Text>
+                      onPress={setPin0Max}>
+                      <Text style={styles.analogBtnText}>OFF (1023)</Text>
                     </TouchableOpacity>
                   </View>
 
                   <View style={styles.analogInfo}>
                     <Text style={styles.analogInfoText}>
-                      Press ON to set pin 0 to maximum analog value (1023)
+                      Press ON to set pin 0 to 0 (turns relay ON)
                     </Text>
                     <Text style={styles.analogInfoText}>
-                      Press OFF to set pin 0 to minimum analog value (0)
+                      Press OFF to set pin 0 to 1023 (turns relay OFF)
                     </Text>
                   </View>
                 </View>
